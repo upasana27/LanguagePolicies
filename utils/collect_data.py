@@ -2,11 +2,20 @@
 
 from pyrep import PyRep
 from pyrep.objects.vision_sensor import VisionSensor
+import sys
+# sys.path.remove('/opt/ros/melodic/lib/python2.7/dist-packages')
+# sys.path.remove('/opt/ros/melodic/lib')
+sys.path.append('home/biswas/orocos_kinematics_dynamics/python_orocos_kdl/build/devel/lib/python3/dist-packages')
+
+sys.path.append('/home/biswas/.local/lib/python3.8/site-packages')
 from ros1compat import kdl_urdf_parser as kdl_parser_py
+# print(kdl_parser_py.__file__)
 import PyKDL as kdl
+# print(kdl.__file__)
 import numpy as np
 import random
 import math
+import sys
 import scipy
 from scipy.interpolate import interp1d
 import hashids
@@ -18,25 +27,25 @@ import os
 
 # How many processes shold collect data in parallel? 
 # A good measure is to put the number of CPU cores you have (Note that each process needs ~1GB of RAM also)
-PROCESSES           = 4
+PROCESSES           =1
 # How many demonstrations (picking and pouring) should each process collect? 
-SAMPLES_PER_PROCESS = 10
+SAMPLES_PER_PROCESS = 20
 # Ever n demonstrations, VRep will be restarted entirely, not just the simulation. You don't need to change this
 RESET_EACH          = 20
 # If you run more than 1 process, you should run VRep headless
-VREP_HEADLESS       = True
+VREP_HEADLESS       = False
 # Default position of the UR5 robot. You do not need to change this
 DEFAULT_UR5_JOINTS  = [105.0, -30.0, 120.0, 90.0, 60.0, 90.0]
 # Path to the UR5 URDF file
-ROBOT_URDF          = "../GDrive/ur5_robot.urdf"
+ROBOT_URDF          = "./GDrive/ur5_robot.urdf"
 # General speed of the robot. Lower values will increase the robot's movement speed
 TGEN_SPEED_FACTOR   = 150
 # Height at which to grasp the cups. You do not need to change this.
 GRASP_HEIGHT        = 0.115
 # Output directory of the collected data
-DATA_PATH           = "../GDrive/collected/"
+DATA_PATH           = "./GDrive/collected/"
 # Where to find the VRep scene file. This has to be an absolute path. 
-VREP_SCENE          = "../GDrive/NeurIPS2020.ttt"
+VREP_SCENE          = "./GDrive/NeurIPS2020.ttt"
 VREP_SCENE          = os.getcwd() + "/" + VREP_SCENE
 
 class SimulatorState(object):
@@ -133,6 +142,7 @@ def genPosition(prev):
 def _getCameraImage(camera):
     rgb_obs = camera.capture_rgb()
     rgb_obs = (np.asarray(rgb_obs) * 255).astype(dtype=np.uint8)
+    print(rgb_obs.shape)
     rgb_obs = np.flip(rgb_obs, (2))
     return rgb_obs
 
@@ -336,6 +346,7 @@ def _setupTask(phase, env, robot, current):
         target3     = [t for t in target2]
         target3[2] += 0.10
         waypoints.append(("L", target3, rot))
+        
     if phase == 1:
         target    = np.random.choice(bowl_ids)
         task["target/id"] = target
@@ -350,12 +361,58 @@ def _setupTask(phase, env, robot, current):
         waypoints.append(("P", None, np.deg2rad(task["amount"])))
         waypoints.append(("I", 40, None))
 
+    if phase == 2:  
+        # for picking the object
+        target    = np.random.choice(cup_ids)
+        task["target/id"] = target
+        task["target/type"] = "cup"
+        target    = _getObjectInfo(ints, floats, target, iscup=True)
+        target[2] = GRASP_HEIGHT
+        rot       = [r for r in current_rot]
+        # calculate angle to be moved
+        rot[0]    += _calculateAngle(target[0], target[1])
+        waypoints.append(("L", [t for t in target], rot))
+        
+        norm        = np.linalg.norm(target[:2], ord=2)
+        factor      = norm / (norm * 0.85)
+        target2     = [t for t in target]
+        target2[0] /= factor
+        target2[1] /= factor
+        #move the arm towards the target
+        waypoints.insert(0, ("J", target2, rot))
+        #grasp the target
+        waypoints.append(("G", None, None))
+        target3     = [t for t in target2]
+        target3[2] += 0.10
+        waypoints.append(("L", target3, rot))
+
+        #define new target  for placing the object
+        target    = np.random.choice(cup_ids)
+        task["target/id"] = target
+        task["target/type"] = "cup"
+        target    = _getObjectInfo(ints, floats, target, iscup=True)
+        target[2] = GRASP_HEIGHT
+        rot       = [r for r in current_rot]
+        #calculate angle to be moved
+        rot[0]    += _calculateAngle(target[0], target[1])
+        waypoints.append(("L", [t for t in target], rot))
+        
+        norm        = np.linalg.norm(target[:2], ord=2)
+        factor      = norm / (norm * 0.85)
+        target2     = [t for t in target]
+        target2[0] /= factor
+        target2[1] /= factor
+        #move the arm towards the target
+        waypoints.insert(0, ("J", target2, rot))
+        #place the object down, define a new function for pouring
+
+
     trajectory       = np.zeros((1,7), dtype=np.float32)
     trajectory[0,:6] = current
     grasp_active     = False if phase == 0 else True
     if grasp_active:
         trajectory[0,-1] = 1.0
-
+    print(waypoints)
     for i, wp in enumerate(waypoints):
         if wp[0] == "L": # Move linear in tool space
             part = _moveL(robot, trajectory[-1,:6], wp[1:], pad_one=grasp_active)
@@ -374,7 +431,7 @@ def _setupTask(phase, env, robot, current):
         
     
     task["trajectory"] = trajectory
-
+    # print(trajectory)
     return task
 
 def _calculateAngle(x, y):
@@ -423,15 +480,17 @@ def collectSingleSample(pyrep):
     done        = False
     task        = None
     environment = None
-    phase       = 0 
+    phase       = 0
     trj_step    = 0
     hid         = hashids.Hashids()
     task_name   = hid.encode(int(time.time() * 1000000))
     while not done:
+        # print(phase)
         state     = _getSimulatorState(pyrep)
         if frame == 0:
             environment = createEnvironment(pyrep)
         elif task is None:
+            print("setup task")
             task               = _setupTask(phase, environment, robot, state.data["joint_robot_position"])
             task["name"]       = task_name
             task["phase"]      = phase
@@ -445,16 +504,18 @@ def collectSingleSample(pyrep):
             task["state/raw"].append(state.toArray())
             task["state/dict"].append(state.data)
             try:
+                # print("set angles")
                 angles    = task["trajectory"][trj_step,:]
                 trj_step += 1
             except IndexError:
+                print("finish task")
                 angles   = task["trajectory"][-1,:]
                 phase   += 1
                 name     = task_name + "_" + str(phase) + ".json"
                 saveTaskToFile(DATA_PATH + name, task)
                 task     = None
                 trj_step = 0
-                if phase == 2:
+                if phase == 3:
                     done = True
             _setJointVelocityFromTarget(pyrep, angles)
 
@@ -481,5 +542,4 @@ if __name__ == "__main__":
     # processes = [Process(target=run, args=()) for i in range(PROCESSES)]
     # [p.start() for p in processes]
     # [p.join() for p in processes]
-
     Parallel(n_jobs=PROCESSES)(delayed(run)() for i in range(PROCESSES))
